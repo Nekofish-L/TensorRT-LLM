@@ -5,7 +5,11 @@ from typing import Dict, Tuple, Union
 
 import pynvml
 import torch
-from cuda import cudart
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 from tensorrt_llm._utils import DictConversion
 from tensorrt_llm.logger import logger
@@ -172,7 +176,7 @@ cluster_infos = {
             float32=60,
         ),
     ),
-    # from https://images.nvidia.cn/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf
+    # from https://images.nvidia.com/content/Solutions/data-center/a40/nvidia-a40-datasheet.pdf
     "A40":
     ClusterInfo(
         intra_node_bw_per_device=_bandwidths["PCIe-4"],

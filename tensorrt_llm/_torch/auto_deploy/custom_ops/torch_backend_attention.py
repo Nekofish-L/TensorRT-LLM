@@ -103,7 +103,7 @@ def _torch_generate_mha(
         # Apply sinks if provided (following the model file pattern)
         if sinks is not None:
             # Concatenate sinks to attention scores
-            sinks = sinks.reshape(-1, 1, 1).expand(-1, attn_scores.shape[-2], -1)
+            sinks = sinks.reshape(-1, 1, 1)
             attn_weights = torch.cat([attn_scores, sinks], dim=-1)
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
             # Use only the non-sink portion for computing output (ignore sinks)
@@ -202,9 +202,7 @@ def _torch_context_mha(
             )  # [seq_len_i, kv_seq_len]
 
             # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
-            sliding_window_mask = (pos_diff < 0) | (
-                pos_diff >= sliding_window_size
-            )  # [seq_len_i, kv_seq_len]
+            sliding_window_mask = pos_diff >= sliding_window_size
 
             # Combine causal and sliding window masks
             combined_mask = causal_mask | sliding_window_mask
@@ -219,14 +217,14 @@ def _torch_context_mha(
         # Apply sinks if provided (following the model file pattern)
         if sinks is not None:
             # Concatenate sinks to attention scores
-            sinks = sinks.reshape(1, -1, 1, 1).expand(
-                attn_scores.shape[0], -1, attn_scores.shape[-2], -1
+            new_sinks = sinks.reshape(1, -1, 1, 1).expand(
+                attn_scores.shape[0], -1, attn_scores.shape[2], 1
             )
-            attn_weights = torch.cat([attn_scores, sinks], dim=-1)
+            attn_weights = torch.cat([attn_scores, new_sinks], dim=-1)
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
             # Use only the non-sink portion for computing output (ignore sinks)
             attn_out = torch.matmul(
-                attn_weights[..., : -sinks.size(-1)], v_seq_t
+                attn_weights[..., : -new_sinks.size(-1)], v_seq_t
             )  # [1, n_heads, seq_len_i, v_head_dim]
         else:
             attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -358,16 +356,16 @@ def torch_backend_mha_with_cache_fake(
 
 @torch.library.custom_op("auto_deploy::torch_cached_attention_prepare_metadata", mutates_args=())
 def torch_backend_prepare_metadata(
-    input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     seq_len: torch.Tensor,
     input_pos: torch.Tensor,
     cache_loc: torch.Tensor,
     pages_per_seq: torch.Tensor,
+    slot_idx: torch.Tensor,
     page_size: int,
 ) -> List[torch.Tensor]:
     """Prepare metadata for torch backend attention (similar to triton backend)."""
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     seq_start = torch.zeros_like(seq_len[:num_seq])
     seq_start[1:] = torch.cumsum(seq_len[: num_seq - 1], 0)
     return (
@@ -380,9 +378,9 @@ def torch_backend_prepare_metadata(
 
 @torch_backend_prepare_metadata.register_fake
 def torch_backend_prepare_metadata_fake(
-    input_ids, position_ids, seq_len, input_pos, cache_loc, pages_per_seq, page_size
+    position_ids, seq_len, input_pos, cache_loc, pages_per_seq, slot_idx, page_size
 ):
-    num_seq = SequenceInfo._get_sanitized_num_sequences(input_ids, seq_len)
+    num_seq = SequenceInfo._get_sanitized_num_sequences(position_ids, seq_len)
     return (
         torch.empty_like(seq_len[:num_seq]),
         torch.empty_like(input_pos[:num_seq]),
@@ -410,7 +408,7 @@ class TorchBackendAttention(AttentionDescriptor):
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
-        return torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
+        return torch.ops.auto_deploy.torch_attention
 
     @classmethod
     def get_cached_attention_op(cls) -> MHACallable:
@@ -461,6 +459,21 @@ class TorchBackendAttention(AttentionDescriptor):
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
+        # Sanity check: layout == "bsnd"
+        # Prefer kwargs; fall back to the final positional arg if it's a string.
+        layout = source_attn_node.kwargs.get("layout", None)
+        if (
+            layout is None
+            and len(source_attn_node.args) > 0
+            and isinstance(source_attn_node.args[-1], str)
+        ):
+            layout = source_attn_node.args[-1]
+        if layout != "bsnd":
+            raise RuntimeError(
+                f"Expected torch_attention layout='bsnd' but got {layout!r} "
+                f"for node: {source_attn_node.format_node()}"
+            )
+
         # Check other arguments
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
@@ -478,8 +491,8 @@ class TorchBackendAttention(AttentionDescriptor):
             scale = source_attn_node.kwargs.get("scale", None)
 
         # Validate scale
-        if not isinstance(scale, float):
-            ad_logger.warning("Provided scale is not a float. Using default scale instead.")
+        if not (isinstance(scale, float) or scale is None):
+            ad_logger.warning(f"Provided {scale=}, is not a float. Using default scale instead.")
             scale = None
 
         # Get sinks, sliding_window, and logit_cap from args or kwargs

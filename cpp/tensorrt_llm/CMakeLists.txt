@@ -294,8 +294,10 @@ if(TARGET ${NIXL_WRAPPER_TARGET})
 endif()
 
 if(NOT WIN32)
-  set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS
-                                                    "-Wl,-rpath='$ORIGIN'")
+  # Load libraries at $PREFIX/lib from
+  # $PREFIX/lib/python3.12/site-packages/tensorrt_llm/libs
+  set_target_properties(${SHARED_TARGET}
+                        PROPERTIES BUILD_RPATH "$ORIGIN;$ORIGIN/../../../..")
 endif()
 
 if(BUILD_PYT)
@@ -312,6 +314,10 @@ endif()
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
+endif()
+
+if(BUILD_DEEP_GEMM)
+  add_subdirectory(deep_gemm)
 endif()
 
 add_subdirectory(plugins)

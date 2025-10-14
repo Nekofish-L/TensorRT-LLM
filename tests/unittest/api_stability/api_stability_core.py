@@ -27,6 +27,7 @@ from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
                                  GuidedDecodingParams, QuantConfig,
                                  RequestOutput, SamplingParams)
+from tensorrt_llm.llmapi.llm_args import SamplerType
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.logger import Singleton
 
@@ -509,7 +510,9 @@ class ApiStabilityTestHarness:
             # step 1: check the method status
             method = getattr(self.TEST_CLASS, method_name)
             if method_name in committed_data.get('methods', {}):
-                continue
+                if method_name != "__init__":
+                    continue
+                # Both committed and non-committed methods have __init__ with different parameters
             if method_name != "__init__":
                 method_status = get_api_status(method)
                 if method_status is None:

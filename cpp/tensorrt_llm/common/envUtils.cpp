@@ -50,6 +50,17 @@ std::optional<size_t> getUInt64Env(char const* name)
     return {val};
 };
 
+std::optional<float> getFloatEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    float const val = std::stof(env);
+    return {val};
+}
+
 std::optional<std::string> getStrEnv(char const* name)
 {
     char const* const env = std::getenv(name);
@@ -307,18 +318,6 @@ bool getEnvDisaggLayerwise()
     return disaggLayerwise;
 }
 
-bool getEnvDisableSelectiveCacheTransfer()
-{
-    static bool const disableSelectiveCacheTransfer = getBoolEnv("TRTLLM_DISABLE_SELECTIVE_CACHE_TRANSFER");
-    return disableSelectiveCacheTransfer;
-}
-
-bool getEnvParallelCacheSend()
-{
-    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
-    return parallelCacheSend;
-}
-
 bool getEnvRequestKVCacheConcurrent()
 {
     static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");
@@ -355,6 +354,12 @@ bool getEnvForceDeterministicMOE()
     return forceDeterministic;
 }
 
+bool getEnvMOEDisableFinalizeFusion()
+{
+    static bool const moeDisableFinalizeFusion = getBoolEnv("TRTLLM_MOE_DISABLE_FINALIZE_FUSION");
+    return moeDisableFinalizeFusion;
+}
+
 bool getEnvForceDeterministicAttention()
 {
     static bool const forceDeterministic
@@ -375,7 +380,7 @@ size_t getEnvAllReduceWorkspaceSize()
     return workspaceSize;
 }
 
-std::string getEnvKVCacheTransferOutputPath()
+std::string const& getEnvKVCacheTransferOutputPath()
 {
     static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
     return outputPath;
@@ -397,7 +402,7 @@ bool getEnvKVCacheTransferUseSyncBuffer()
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
 
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
+    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(1);
     return maxConcurrenceNum;
 }
 

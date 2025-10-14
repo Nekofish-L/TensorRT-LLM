@@ -184,9 +184,6 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
-        for request in active_requests:
-            if len(request.py_draft_tokens) > 0:
-                request.draft_tokens = request.py_draft_tokens
         return self.impl(active_requests, inflight_request_ids,
                          self.max_batch_size, self.max_num_tokens)
 

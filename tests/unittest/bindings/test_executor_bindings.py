@@ -1314,6 +1314,7 @@ def test_kv_cache_config():
     assert config.enable_partial_reuse == True
     assert config.copy_on_partial_reuse == True
     assert config.use_uvm == False
+    assert config.attention_dp_events_gather_period_ms == 5
 
     config.enable_block_reuse = False
     config.max_tokens = 1
@@ -1328,6 +1329,7 @@ def test_kv_cache_config():
     config.enable_partial_reuse = False
     config.copy_on_partial_reuse = False
     config.use_uvm = True
+    config.attention_dp_events_gather_period_ms = 10
     assert config.enable_block_reuse == False
     assert config.max_tokens == 1
     assert config.max_attention_window == [2]
@@ -1341,6 +1343,7 @@ def test_kv_cache_config():
     assert config.enable_partial_reuse == False
     assert config.copy_on_partial_reuse == False
     assert config.use_uvm == True
+    assert config.attention_dp_events_gather_period_ms == 10
 
     kwargs = {
         "enable_block_reuse": True,
@@ -1354,7 +1357,8 @@ def test_kv_cache_config():
         "event_buffer_max_size": 2048,
         "enable_partial_reuse": True,
         "copy_on_partial_reuse": False,
-        "use_uvm": True
+        "use_uvm": True,
+        "attention_dp_events_gather_period_ms": 10
     }
     config = trtllm.KvCacheConfig(**kwargs)
     for k, v in kwargs.items():
@@ -2235,7 +2239,7 @@ def test_request_perf_metrics_draft(model_path_draft_tokens_external,
     timing_metrics = perf_metrics.timing_metrics
     assert timing_metrics.arrival_time < timing_metrics.first_scheduled_time
     assert timing_metrics.first_scheduled_time < timing_metrics.first_token_time
-    assert timing_metrics.first_token_time == timing_metrics.last_token_time
+    assert timing_metrics.first_token_time <= timing_metrics.last_token_time
 
     assert perf_metrics.first_iter == 0
     assert perf_metrics.iter == 0

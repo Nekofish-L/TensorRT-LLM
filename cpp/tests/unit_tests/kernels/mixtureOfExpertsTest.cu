@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
@@ -9,15 +25,16 @@
 
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
 #include "tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h"
+#include <tensorrt_llm/kernels/quantization.h>
 #else
 #include "moe_kernels.h"
+#include "quantization.h"
 #endif
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
 
 #include "tensorrt_llm/runtime/bufferManager.h"
 
 #include <tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h>
-#include <tensorrt_llm/kernels/quantization.h>
 
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
@@ -27,6 +44,7 @@ using namespace CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
 using CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
 using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::CutlassMoeFCRunner;
 using CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::ActivationParams;
 using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
 constexpr static float FP8_MAX = 448.f;
@@ -128,6 +146,8 @@ protected:
     using OutputType = typename TypeTuple_::OutputType;
     using ActivationScale = typename TypeTuple_::ActivationScale;
     using WeightScale = typename TypeTuple_::WeightScale;
+
+    using BackBoneType = OutputType;
     constexpr static bool INT4 = std::is_same_v<WeightType, cutlass::uint4b_t>;
     constexpr static bool ACT_FP8 = std::is_same_v<GemmDataType, SafeFP8>;
     constexpr static bool WEIGHT_FP8 = std::is_same_v<WeightType, SafeFP8>;
@@ -149,14 +169,16 @@ protected:
     constexpr static bool ANY_FPX = ANY_FP4 || FP8;
 
     constexpr static bool INT_QUANT = !std::is_same_v<GemmDataType, WeightType> && std::is_integral_v<WeightType>;
-    constexpr static int WEIGHT_ELEM_PER_BYTE = (INT4 || WEIGHT_FP4) ? 2 : 1;
+    constexpr static int64_t WEIGHT_ELEM_PER_BYTE = (INT4 || WEIGHT_FP4) ? 2 : 1;
     using InputType = std::conditional_t<NVFP4 || MXFP8_MXFP4, OutputType, GemmDataType>;
     using WeightStorage = std::conditional_t<WEIGHT_ELEM_PER_BYTE == 2, uint8_t, WeightType>;
     constexpr static int64_t HIDDEN_SIZE_MULTIPLIER = 16;
     constexpr static int64_t MINIMUM_BYTE_ALIGNMENT
         = MX_QUANT_WEIGHT ? 64 : 128 / 8; // TMA requires 128 bits alignment, MX quant requires 64 bytes
-    constexpr static int64_t MINIMUM_ALIGNMENT = MINIMUM_BYTE_ALIGNMENT * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
-    constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT;
+    constexpr static int64_t MINIMUM_ALIGNMENT_CONST
+        = MINIMUM_BYTE_ALIGNMENT * WEIGHT_ELEM_PER_BYTE / sizeof(WeightStorage);
+    constexpr static int64_t DEFAULT_HIDDEN_SIZE = HIDDEN_SIZE_MULTIPLIER * MINIMUM_ALIGNMENT_CONST;
+    int64_t mDeviceMinimumAlignment = MINIMUM_ALIGNMENT_CONST; // SM103 has different minimum alignment
 
     // FP4 uses the unquantized data type for inputs and quantizes on the fly
     using DataType = std::conditional_t<NVFP4 || MXFP8_MXFP4, OutputType, GemmDataType>;
@@ -172,6 +194,7 @@ protected:
     DataType* mInputTensor{};
 
     int64_t mHiddenSize{};
+    int64_t mUnpaddedHiddenSize{}; // If 0, defaults to mHiddenSize
     int64_t mNumExperts{};
     int64_t mK{};
 
@@ -199,7 +222,7 @@ protected:
 #endif
         bool should_skip_no_device = mDeviceCount <= 0;
         bool should_skip_unsupported_fp8 = getSMVersion() < 89 && FP8;
-        bool should_skip_unsupported_fp4 = (getSMVersion() < 100 || getSMVersion() >= 120) && ANY_FP4;
+        bool should_skip_unsupported_fp4 = (getSMVersion() < 100) && ANY_FP4;
         return should_skip_no_device || should_skip_unsupported_fp8 || should_skip_unsupported_fp4;
     }
 
@@ -228,11 +251,19 @@ protected:
             GTEST_SKIP() << "Skipping due to no/unsupported GPU";
         }
         assert(mBufferManager);
+
+        int sm = getSMVersion();
+        if (sm >= 100)
+        {
+            mDeviceMinimumAlignment
+                = std::max(MINIMUM_ALIGNMENT_CONST, int64_t(WEIGHT_ELEM_PER_BYTE * 32 / sizeof(WeightStorage)));
+        }
     }
 
     void TearDown() override
     {
         managed_buffers.clear();
+        mUnpaddedHiddenSize = 0; // Reset for next test
         ASSERT_EQ(cudaStreamSynchronize(mStream->get()), cudaSuccess);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         ASSERT_EQ(cudaGetLastError(), cudaSuccess);
@@ -245,11 +276,11 @@ protected:
         initWeightsKernel<WeightRawType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, base, scalar);
     }
 
-    void initBias(DataType* buffer, int64_t w)
+    void initBias(BackBoneType* buffer, int64_t w)
     {
         dim3 block(256, 1, 1);
         dim3 grid(divUp(w, block.x), mNumExperts);
-        initBiasToExpertIdKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w);
+        initBiasToExpertIdKernel<BackBoneType><<<grid, block, 0, mStream->get()>>>(buffer, w);
     }
 
     void initWeightsGated(WeightRawType* buffer, int64_t w, int64_t h, float base_1, float base_2, float scalar)
@@ -263,7 +294,7 @@ protected:
         initWeightsGatedKernel<WeightRawType><<<grid, block, 0, mStream->get()>>>(buffer, w, h, base_1, base_2, scalar);
     }
 
-    void initBiasGated(DataType* buffer, int64_t w)
+    void initBiasGated(BackBoneType* buffer, int64_t w)
     {
         if (!mIsGated)
             return initBias(buffer, w);
@@ -271,10 +302,10 @@ protected:
         w /= 2;
         dim3 block(256, 1, 1);
         dim3 grid(divUp(w, block.x), mNumExperts);
-        initBiasToExpertIdGatedKernel<DataType><<<grid, block, 0, mStream->get()>>>(buffer, w);
+        initBiasToExpertIdGatedKernel<BackBoneType><<<grid, block, 0, mStream->get()>>>(buffer, w);
     }
 
-    CutlassMoeFCRunner<GemmDataType, WeightType, OutputType, InputType> mMoERunner{};
+    CutlassMoeFCRunner<GemmDataType, WeightType, OutputType, InputType, BackBoneType> mMoERunner{};
     char* mWorkspace{};
     int* mSelectedExpert;
     float* mTokenFinalScales{};
@@ -282,6 +313,14 @@ protected:
     WeightRawType* mRawExpertWeight2{};
     WeightStorage* mExpertWeight1{};
     WeightStorage* mExpertWeight2{};
+
+    float mSwigluAlphaValue{0.5f};
+    float mSwigluBetaValue{MX_QUANT_ACT ? 0.0f : 1.f};
+    float mSwigluLimitValue{MX_QUANT_ACT ? FP8_MAX / 4 : NVFP4 ? 2.f : 0.5f};
+    float* mSwigluAlpha{};
+    float* mSwigluBeta{};
+    float* mSwigluLimit{};
+
     DataType* mExpertIntScale1{};
     DataType* mExpertIntScale2{};
 
@@ -314,8 +353,8 @@ protected:
     ElementSF* mFP4ScalingFactorsW1 = nullptr;
     ElementSF* mFP4ScalingFactorsW2 = nullptr;
 
-    DataType* mExpertBias1{};
-    DataType* mExpertBias2{};
+    BackBoneType* mExpertBias1{};
+    BackBoneType* mExpertBias2{};
 
     void* mTpExpertScratch{}; // Copy the experts here when slicing up inputs
     size_t mTpExpertScratchSize{};
@@ -342,8 +381,14 @@ protected:
 
     float mSparseMixerEpsilon = 0.2f;
 
-    // Default this to true. This only matters for K>2, and so by doing this we will test the fused and unfused paths
-    bool mUseDeterminsiticHopperReduce = true;
+    // Default this to false. This only matters for K>2, and so by doing this we will test the fused and unfused paths
+    bool mUseFusedFinalize = false;
+    // The internal fused finalize variable, true if k < 3 or mUseFusedFinalize is true
+    bool mUseFusedFinalizeInternal = false;
+
+    // Default this to TMA. This only matters for SM10x.
+    tensorrt_llm::cutlass_extensions::EpilogueScheduleType mEpilogueSchedule
+        = tensorrt_llm::cutlass_extensions::EpilogueScheduleType::TMA;
 
     // Disable this for long running tests to speed up runtime
     bool mIsLongTest = false;
@@ -422,23 +467,28 @@ protected:
         return (freeMem + memory_pool_free_mem_size) * freeMemBuffer >= total_size;
     }
 
-    void initBuffersPermute(std::vector<DataType> h_hidden_states, std::vector<int> h_token_selected_experts,
-        std::vector<float> h_token_final_scales, int64_t hidden_size, int64_t num_experts, int64_t k,
-        MOEParallelismConfig parallelism_config)
+    void initLocals(int64_t hidden_size, int64_t num_experts, int64_t k, int64_t num_tokens)
     {
-        managed_buffers.clear();
-
-        mMoERunner.use_deterministic_hopper_reduce_ = k > 2 && mUseDeterminsiticHopperReduce;
-
         mHiddenSize = hidden_size;
         mInterSize = hidden_size * mInterSizeFraction;
         mNumExperts = num_experts;
         mK = k;
         mIsGated = isGatedActivation(mActType);
         mGatedMultiplier = mIsGated ? 2 : 1;
+        mUseFusedFinalizeInternal = mUseFusedFinalize || k < 3;
+        mMoERunner.use_fused_finalize_ = mUseFusedFinalizeInternal;
+        mTotalTokens = num_tokens;
+    }
+
+    void initBuffersPermute(std::vector<DataType> h_hidden_states, std::vector<int> h_token_selected_experts,
+        std::vector<float> h_token_final_scales, int64_t hidden_size, int64_t num_experts, int64_t k,
+        MOEParallelismConfig parallelism_config)
+    {
+        managed_buffers.clear();
+
         auto const gated_inter = mInterSize * mGatedMultiplier;
 
-        mTotalTokens = h_hidden_states.size() / hidden_size;
+        EXPECT_EQ(h_hidden_states.size() / hidden_size, mTotalTokens);
         EXPECT_EQ(h_token_selected_experts.size(), mTotalTokens * mK);
         EXPECT_EQ(h_token_final_scales.size(), mTotalTokens * mK);
 
@@ -467,12 +517,14 @@ protected:
         if (mUseBias)
         {
             // Allow space for the slice of bias1 in the scratch
-            mTpExpertScratchSize += sizeof(DataType) * experts_per_node * gated_inter / parallelism_config.tp_size;
-            mExpertBias1 = allocBuffer<DataType>(mNumExperts * gated_inter);
-            mExpertBias2 = allocBuffer<DataType>(mNumExperts * mHiddenSize);
+            mTpExpertScratchSize += sizeof(BackBoneType) * experts_per_node * gated_inter / parallelism_config.tp_size;
+            mExpertBias1 = allocBuffer<BackBoneType>(mNumExperts * gated_inter);
+            mExpertBias2 = allocBuffer<BackBoneType>(mNumExperts * mHiddenSize);
 
-            check_cuda_error(cudaMemsetAsync(mExpertBias1, 0x0, mNumExperts * gated_inter * sizeof(DataType), stream));
-            check_cuda_error(cudaMemsetAsync(mExpertBias2, 0x0, mNumExperts * mHiddenSize * sizeof(DataType), stream));
+            check_cuda_error(
+                cudaMemsetAsync(mExpertBias1, 0x0, mNumExperts * gated_inter * sizeof(BackBoneType), stream));
+            check_cuda_error(
+                cudaMemsetAsync(mExpertBias2, 0x0, mNumExperts * mHiddenSize * sizeof(BackBoneType), stream));
         }
 
         if constexpr (INT_QUANT)
@@ -538,6 +590,22 @@ protected:
         mFinalOutput = allocBuffer<OutputType>(mTotalTokens * mHiddenSize);
 
         mSourceToExpandedMap = allocBuffer<int>(mTotalTokens * mK);
+
+        if (mActType == ActivationType::SwigluBias)
+        {
+            mSwigluAlpha = allocBuffer<float>(mNumExperts);
+            mSwigluBeta = allocBuffer<float>(mNumExperts);
+            mSwigluLimit = allocBuffer<float>(mNumExperts);
+            std::vector<float> h_swiglu_alpha(mNumExperts, mSwigluAlphaValue);
+            std::vector<float> h_swiglu_beta(mNumExperts, mSwigluBetaValue);
+            std::vector<float> h_swiglu_limit(mNumExperts, mSwigluLimitValue);
+            check_cuda_error(cudaMemcpyAsync(
+                mSwigluAlpha, h_swiglu_alpha.data(), mNumExperts * sizeof(float), cudaMemcpyHostToDevice, stream));
+            check_cuda_error(cudaMemcpyAsync(
+                mSwigluBeta, h_swiglu_beta.data(), mNumExperts * sizeof(float), cudaMemcpyHostToDevice, stream));
+            check_cuda_error(cudaMemcpyAsync(
+                mSwigluLimit, h_swiglu_limit.data(), mNumExperts * sizeof(float), cudaMemcpyHostToDevice, stream));
+        }
 
         check_cuda_error(cudaMemcpyAsync(mSelectedExpert, h_token_selected_experts.data(),
             mTotalTokens * mK * sizeof(int), cudaMemcpyHostToDevice, stream));
@@ -606,9 +674,15 @@ protected:
         int64_t padded_in_dim = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(in_shape, MinKDimAlignmentFP4);
         check_cuda_error(cudaMemsetAsync(scaling_factors, 0x00,
             num_experts * padded_out_dim * padded_in_dim / FP4VecSize * sizeof(ElementSF), mStream->get()));
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        invokeFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights, global_scales,
+            reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors), MX_QUANT_WEIGHT,
+            tensorrt_llm::QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
+#else
         invokeBatchedFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights,
             global_scales, reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors),
             MX_QUANT_WEIGHT, mMultiProcessorCount, mStream->get());
+#endif
 
         // auto sf_data = getDataFromDevice<ElementSF>(scaling_factors, num_experts * padded_out_dim * padded_in_dim /
         // FP4VecSize); auto unquant_data = getDataFromDevice<WeightRawType>(raw_weights, num_experts * out_shape *
@@ -873,7 +947,8 @@ protected:
             // Generates numbers in increments of 1/max_order_of_magnitude in the range [0, 1)
             constexpr int max_order_of_magnitude = 256;
             std::vector<int> base(hidden_states.size());
-            std::iota(base.begin(), base.end(), 0);
+            // Start from the near largest value so we always have some large values even for small hidden sizes
+            std::iota(base.begin(), base.end(), max_order_of_magnitude - 4);
             std::mt19937 gen(0xD5);
             std::shuffle(base.begin(), base.end(), gen);
             // Lambda subtracts a small value so we have some < 0 to test the activation for negatives
@@ -998,7 +1073,7 @@ protected:
         auto* weight_1 = reinterpret_cast<SliceWeightType*>(mTpExpertScratch);
         auto* weight_2 = weight_1 + experts_per_node * gated_matrix_size / SLICED_WEIGHT_ELEM_PER_BYTE;
         auto* bias_1
-            = reinterpret_cast<DataType*>(weight_2 + experts_per_node * matrix_size / SLICED_WEIGHT_ELEM_PER_BYTE);
+            = reinterpret_cast<BackBoneType*>(weight_2 + experts_per_node * matrix_size / SLICED_WEIGHT_ELEM_PER_BYTE);
 
         // 2D memcpy just the slices we care about
         // TODO Re-quantize here with matrices divided
@@ -1014,7 +1089,7 @@ protected:
 
         if (mUseBias)
         {
-            size_t const row_size_bias = row_size_inter * sizeof(DataType);
+            size_t const row_size_bias = row_size_inter * sizeof(BackBoneType);
             check_cuda_error(cudaMemcpy2DAsync(bias_1, row_size_bias, (uint8_t*) bias1_ptr + row_size_bias * tp_rank,
                 row_size_bias * tp_size, row_size_bias, experts_per_node * mGatedMultiplier, cudaMemcpyDeviceToDevice,
                 mStream->get()));
@@ -1034,9 +1109,9 @@ protected:
         return std::tuple{(void*) weight_1, (void*) weight_2, bias_1, bias2_ptr, scale_1, scale_2, scale_3};
     }
 
-    auto getFilteredConfigs(int sm)
+    auto getFilteredConfigs(int sm, MoeGemmId gemm_id)
     {
-        auto tactics = mMoERunner.getTactics();
+        auto tactics = mMoERunner.getTactics(gemm_id);
         if (sm == 89 || sm >= 120)
         {
             // Filter some unsupported configs for L40S
@@ -1060,24 +1135,47 @@ protected:
         }
 
         EXPECT_FALSE(tactics.empty());
-
         return tactics;
     }
 
-    auto selectTacticsForArch(int sm)
+    auto selectTacticsForArch(int sm, bool exact_match = false)
     {
         bool is_tma_warp_specialized = sm >= 90 && !INT_QUANT;
-        auto tactics = getFilteredConfigs(sm);
-        auto it = std::find_if(tactics.begin(), tactics.end(),
-            [is_tma_warp_specialized](auto& c) { return c.is_tma_warp_specialized == is_tma_warp_specialized; });
-        if (it == tactics.end())
+        auto epilogue_fusion_type = (is_tma_warp_specialized && mUseFusedFinalizeInternal)
+            ? tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
+            : tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
+
+        auto smExact = [exact_match, sm](auto& c) { return !exact_match || c.sm_version == sm; };
+        auto epilogueMatch = [this](auto& c)
+        {
+            return c.sm_version < 100 || c.sm_version >= 120
+                || c.epilogue_fusion_type
+                == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
+                || (c.sm_version == 100 && this->ANY_FP4) || c.epilogue_schedule == this->mEpilogueSchedule;
+        };
+        auto epilogueFusionMatch
+            = [epilogue_fusion_type](auto& c) { return c.epilogue_fusion_type == epilogue_fusion_type; };
+
+        auto tactics1 = getFilteredConfigs(sm, MoeGemmId::GEMM_1);
+        auto tactics2 = getFilteredConfigs(sm, MoeGemmId::GEMM_2);
+        auto it1 = std::find_if(tactics1.begin(), tactics1.end(),
+            [is_tma_warp_specialized, epilogueMatch, smExact](auto& c)
+            { return c.is_tma_warp_specialized == is_tma_warp_specialized && epilogueMatch(c) && smExact(c); });
+        auto it2 = std::find_if(tactics2.begin(), tactics2.end(),
+            [is_tma_warp_specialized, epilogueMatch, epilogueFusionMatch, smExact](auto& c)
+            {
+                return c.is_tma_warp_specialized == is_tma_warp_specialized && epilogueFusionMatch(c)
+                    && epilogueMatch(c) && smExact(c);
+            });
+        if (it1 == tactics1.end() || it2 == tactics2.end())
         {
             // Fall back to any tactic
             std::cout << "WARNING: Could not find config for sm version " << sm << std::endl;
-            return std::pair{tactics[0], tactics[0]};
+            it1 = (it1 == tactics1.end()) ? tactics1.begin() : it1;
+            it2 = (it2 == tactics2.end()) ? tactics2.begin() : it2;
         }
 
-        return std::pair(*it, *it);
+        return std::pair(*it1, *it2);
     }
 
     using ConfigsToTestVec = std::vector<std::pair<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
@@ -1091,11 +1189,17 @@ protected:
         }
 
         int sm = getSMVersion();
-        ConfigsToTestVec tactics = {selectTacticsForArch(sm)};
+        bool needs_exact_match = sm == 103 && NVFP4;
+        ConfigsToTestVec tactics = {selectTacticsForArch(sm, needs_exact_match)};
+        if (sm == 103 && NVFP4)
+        {
+            // SM103 NVFP4 should also test SM100f kernels
+            tactics.push_back(selectTacticsForArch(100, true));
+        }
         if (sm >= 90 && !ANY_FPX)
         {
             // SM90+ should also grab some configs for SM80 to test them
-            tactics.push_back(selectTacticsForArch(80));
+            tactics.push_back(selectTacticsForArch(80, true));
         }
         return tactics;
     }
@@ -1111,7 +1215,7 @@ protected:
         auto stream = mStream->get();
         auto tactic1 = mInternalSelectedConfig1;
         auto tactic2 = mInternalSelectedConfig2;
-        if (!tactic1)
+        if (!tactic1 || !tactic2)
         {
             int sm = getSMVersion();
             std::tie(tactic1, tactic2) = selectTacticsForArch(sm);
@@ -1173,15 +1277,18 @@ protected:
         MoeMinLatencyParams min_latency_params;
         mMoERunner.setTactic(tactic1, tactic2);
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
-            weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
-            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall,
-            mUseLora, lora_params, useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+        mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
+            mTotalTokens, mHiddenSize, mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize,
+            mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
+            parallelism_config, enable_alltoall, mUseLora, lora_params, useFp8BlockScales, minLatencyMode,
+            min_latency_params, stream);
 #else
-        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr, mActType,
-            weight2_ptr, bias2_ptr, quant_params, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size,
-            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
-            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+        mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
+            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
+            mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params, useFp8BlockScales,
+            minLatencyMode, min_latency_params, stream);
 #endif
 
         check_cuda_error(cudaStreamSynchronize(stream));
@@ -1255,20 +1362,27 @@ protected:
     }
 
     template <class T>
-    T actfn(T in)
+    T actfn(T gate, T linear = T(0.0f), ActivationType act_type = ActivationType::InvalidType)
     {
-        if (mActType == ActivationType::Identity)
-            return in;
-        if (mActType == ActivationType::Relu)
-            return std::max(in, T(0.0f));
-        if (mActType == ActivationType::Gelu || mActType == ActivationType::Geglu)
-            return (std::erf(float(in) * float(sqrt(0.5))) + 1) * 0.5f * float(in);
-        if (mActType == ActivationType::Silu || mActType == ActivationType::Swiglu)
+        if (act_type == ActivationType::InvalidType)
+            act_type = mActType;
+
+        switch (act_type)
         {
-            return (float(in) / (1.f + std::exp(-(in))));
+        case ActivationType::Identity: return gate;
+        case ActivationType::Relu: return std::max(gate, T(0.0f));
+        case ActivationType::Gelu: return ((std::erf(float(gate) * float(sqrt(0.5))) + 1) * 0.5f * float(gate));
+        case ActivationType::Silu: return (float(gate) / (1.f + std::exp(-(gate))));
+        case ActivationType::Geglu: return actfn(gate, 0.0f, ActivationType::Gelu) * linear;
+        case ActivationType::Swiglu: return actfn(gate, 0.0f, ActivationType::Silu) * linear;
+        case ActivationType::SwigluBias:
+            linear = std::min(std::max(linear, -mSwigluLimitValue), mSwigluLimitValue);
+            gate = std::min(gate, mSwigluLimitValue);
+            // silu(gate * alpha) / alpha = gate * sigmoid(gate * alpha)
+            return actfn(gate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue
+                * (linear + mSwigluBetaValue);
+        default: assert(false); return gate;
         }
-        assert(false);
-        return in;
     }
 
     float quantAct(float in, float block_max)
@@ -1292,15 +1406,14 @@ protected:
         if (mIsGated)
         {
             float scalar = applyExpertShift(mExpertWDiag1, expert_id);
-            float fc1 = input * scalar + w1_bias;
-
+            float linear = input * scalar + w1_bias;
             float gated_scalar = applyExpertShift(mExpertWDiagGated, expert_id);
             float gated_bias = mUseBias ? w1_bias + 1.f : 0.f;
             float gate = input * gated_scalar + gated_bias;
 
-            activated = fc1 * actfn(gate);
+            activated = actfn(gate, linear);
 
-            block_max = (block_max * scalar + w1_bias) * actfn(block_max * gated_scalar + gated_bias);
+            block_max = actfn(block_max * gated_scalar + gated_bias, block_max * scalar + w1_bias);
         }
         else
         {
@@ -1390,16 +1503,25 @@ protected:
     void compareFinal(std::vector<int> const& expected_experts, std::vector<float> const& token_final_scales,
         std::vector<OutputType> const& input_data, std::vector<OutputType> final_results = {})
     {
+        if (mActType == ActivationType::SwigluBias)
+        {
+            ASSERT_GT(mMaxInput * std::max(mExpertWDiag1, mExpertWDiagGated), mSwigluLimitValue)
+                << "SwigluBias limit values don't change the result";
+        }
+
         ASSERT_EQ(expected_experts.size(), token_final_scales.size());
         ASSERT_EQ(expected_experts.size() / mK, input_data.size() / mHiddenSize);
         if (final_results.empty())
             final_results = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
 
+        // Use unpadded size for validation if set
+        int64_t hidden_size_to_check = mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize;
+
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
             float block_max = 1.f;
             // NOTE: When mInterSize < mHiddenSize, those values get zeroed out by fc1 and lost
-            for (int64_t hidden_id = 0; hidden_id < std::min(mHiddenSize, mInterSize); hidden_id++)
+            for (int64_t hidden_id = 0; hidden_id < std::min(hidden_size_to_check, mInterSize); hidden_id++)
             {
                 if (MX_QUANT_ACT && hidden_id % FP4VecSize == 0)
                 {
@@ -1418,9 +1540,11 @@ protected:
                     sum += final_value * final_scale_value;
                 }
 
-                ASSERT_NEAR(OutputType{sum}, final_results[token_id * mHiddenSize + hidden_id], getTolerance(sum))
-                    << "Incorrect final value at for token: " << token_id << " offset: " << hidden_id
-                    << " hidden_size: " << mHiddenSize << " inter_size: " << mInterSize;
+                ASSERT_NEAR(
+                    OutputType{sum}, final_results[token_id * hidden_size_to_check + hidden_id], getTolerance(sum))
+                    << "Incorrect final value at for token: " << token_id << "/" << mTotalTokens
+                    << " offset: " << hidden_id << " hidden_size: " << mHiddenSize
+                    << " unpadded_hidden_size: " << mUnpaddedHiddenSize << " inter_size: " << mInterSize;
             }
         }
     }
@@ -1449,7 +1573,7 @@ protected:
         int64_t num_tokens = 3, float inter_size_fraction = 1.0f)
     {
         // Ensure we dont drop below the minimum alignment
-        mInterSizeFraction = std::max(inter_size_fraction, MINIMUM_ALIGNMENT * 8.0f / hidden_size);
+        mInterSizeFraction = std::max(inter_size_fraction, mDeviceMinimumAlignment * 8.0f / hidden_size);
         ParallelismTest(k, 2, 1, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 4, 1, hidden_size, num_experts, num_tokens);
         ParallelismTest(k, 8, 1, hidden_size, num_experts, num_tokens);
@@ -1458,7 +1582,7 @@ protected:
     void MixedParallelTest(int k = 1, int64_t hidden_size = DEFAULT_HIDDEN_SIZE, int64_t num_experts = 4,
         int64_t num_tokens = 3, float inter_size_fraction = 1.0f)
     {
-        mInterSizeFraction = std::max(inter_size_fraction, MINIMUM_ALIGNMENT * 8.0f / hidden_size);
+        mInterSizeFraction = std::max(inter_size_fraction, mDeviceMinimumAlignment * 8.0f / hidden_size);
 
         // 2 experts per rank
         ParallelismTest(k, 2, num_experts / 2, hidden_size, num_experts, num_tokens);
@@ -1533,7 +1657,7 @@ template <class TypeParam_>
 void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
     int k, int64_t hidden_size, int64_t num_experts, int64_t num_tokens)
 {
-    if constexpr (ANY_FPX)
+    if (NVFP4 || (MXFP8_MXFP4 && isGatedActivation(mActType)))
     {
         // TODO Remove this when bias + FPX is supported
         mUseBias = false;
@@ -1544,10 +1668,12 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         if (mActType != ActivationType::Relu)
         {
             // FP4 has far too little precision to get any sort of consistency with non-relu actfn
-            GTEST_SKIP();
+            GTEST_SKIP() << "Skipping FP4 test with non-relu actfn";
             return;
         }
     }
+
+    initLocals(hidden_size, num_experts, k, num_tokens);
 
     auto test_archs = getAllTileConfigsToTest();
     for (auto [gemm1, gemm2] : test_archs)
@@ -1562,8 +1688,9 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool should_be_deterministic
-            = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+        bool is_finalize_fusion = gemm2.epilogue_fusion_type
+            == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+        bool should_be_deterministic = !is_finalize_fusion || mK < 3;
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1672,9 +1799,46 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwiglu)
     this->BasicPermuteTest(3);
 }
 
+TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluBias)
+{
+    this->mActType = ActivationType::SwigluBias;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteNoSmemEpilogueSchedule)
+{
+    if (getSMVersion() < 100 || getSMVersion() >= 120 || (getSMVersion() == 100 && this->NVFP4))
+    {
+        GTEST_SKIP() << "NoSmem is only supported for SM10x and SM100 without NVFP4";
+        return;
+    }
+
+    this->mEpilogueSchedule = tensorrt_llm::cutlass_extensions::EpilogueScheduleType::NO_SMEM;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluNoSmemEpilogueSchedule)
+{
+    if (getSMVersion() < 100 || getSMVersion() >= 120 || (getSMVersion() == 100 && this->NVFP4))
+    {
+        GTEST_SKIP() << "NoSmem is only supported for SM10x and SM100 without NVFP4";
+        return;
+    }
+
+    this->mActType = ActivationType::Swiglu;
+    this->mEpilogueSchedule = tensorrt_llm::cutlass_extensions::EpilogueScheduleType::NO_SMEM;
+    this->BasicPermuteTest();
+    this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
 TYPED_TEST(MixtureOfExpertsTest, PermuteNonDeterministic)
 {
-    this->mUseDeterminsiticHopperReduce = false;
+    this->mUseFusedFinalize = true;
     // Just test case 3, cases 1&2 always use the fused paths
     this->BasicPermuteTest(3);
 }
@@ -1683,9 +1847,9 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteVerySmall)
 {
     for (int i = 1; i <= 3; i++)
     {
-        this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(3, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(1, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(2, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(3, this->mDeviceMinimumAlignment * i);
     }
 }
 
@@ -1708,7 +1872,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteManyExperts)
 {
     this->mIsLongTest = true;
     /* This test is very slow. Only do one k value */
-    this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT, 512);
+    this->BasicPermuteTest(2, this->mDeviceMinimumAlignment, 512);
 }
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
@@ -1716,9 +1880,9 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluVerySmall)
     this->mActType = ActivationType::Swiglu;
     for (int i = 1; i <= 3; i++)
     {
-        this->BasicPermuteTest(1, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(2, this->MINIMUM_ALIGNMENT * i);
-        this->BasicPermuteTest(3, this->MINIMUM_ALIGNMENT * i);
+        this->BasicPermuteTest(1, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(2, this->mDeviceMinimumAlignment * i);
+        this->BasicPermuteTest(3, this->mDeviceMinimumAlignment * i);
     }
 }
 
@@ -1750,7 +1914,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteDeepSeekV3)
 TYPED_TEST(MixtureOfExpertsTest, MinimumAlignment)
 {
     this->mInterSizeFraction = 1;
-    this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE + this->MINIMUM_ALIGNMENT);
+    this->BasicPermuteTest(1, this->DEFAULT_HIDDEN_SIZE + this->mDeviceMinimumAlignment);
 }
 
 template <class TypeParam_>
@@ -1776,7 +1940,7 @@ template <class TypeParam_>
 void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     int k, int tp_size, int ep_size, int64_t hidden_size, int64_t num_experts, int64_t num_tokens, bool enable_alltoall)
 {
-    if (ANY_FPX)
+    if (NVFP4 || (MXFP8_MXFP4 && isGatedActivation(mActType)))
     {
         // TODO Remove this when bias + FPX is supported
         mUseBias = false;
@@ -1800,6 +1964,8 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
             << "Expert parallelism must have less than 4 experts per rank or the test is ineffective";
     }
 
+    initLocals(hidden_size, num_experts, k, num_tokens);
+
     auto test_archs = getAllTileConfigsToTest();
     for (auto [gemm1, gemm2] : test_archs)
     {
@@ -1821,8 +1987,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
+                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
+                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
-                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1837,8 +2005,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 else
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
+                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
+                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
-                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1941,6 +2111,13 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
         this->ParallelismType##Test(2);                                                                                \
         this->ParallelismType##Test(3);                                                                                \
     }                                                                                                                  \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##SwigluBias)                                                      \
+    {                                                                                                                  \
+        this->mActType = ActivationType::SwigluBias;                                                                   \
+        this->ParallelismType##Test();                                                                                 \
+        this->ParallelismType##Test(2);                                                                                \
+        this->ParallelismType##Test(3);                                                                                \
+    }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##Mixtral8x7b)                                                     \
     {                                                                                                                  \
@@ -1956,14 +2133,37 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
         this->mActType = ActivationType::Swiglu;                                                                       \
         size_t hidden_size = 7168;                                                                                     \
         size_t inter_size = 2048;                                                                                      \
-        this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
+        float inter_size_fraction = float(inter_size) / hidden_size;                                                   \
                                                                                                                        \
         if (!this->checkSufficientTestMemory(75, hidden_size, 256, 8, true))                                           \
         {                                                                                                              \
             GTEST_SKIP() << "Insufficient free memory for test";                                                       \
         }                                                                                                              \
                                                                                                                        \
-        this->ParallelismType##Test(8, hidden_size, 256, 75, this->mInterSizeFraction);                                \
+        this->ParallelismType##Test(8, hidden_size, 256, 75, inter_size_fraction);                                     \
+    }                                                                                                                  \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##GptOss120b)                                                      \
+    {                                                                                                                  \
+        this->mIsLongTest = true;                                                                                      \
+        this->mUseBias = true;                                                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
+        size_t hidden_size = 2944;                                                                                     \
+        size_t inter_size = 2944;                                                                                      \
+        if (std::string(#ParallelismType) != "ExpertParallel")                                                         \
+        {                                                                                                              \
+            /* If with TP, the inter_size should also be padded, */                                                    \
+            /* so that after TP split the alignment requirement is still met */                                        \
+            inter_size = 3072;                                                                                         \
+        }                                                                                                              \
+        float inter_size_fraction = float(inter_size) / hidden_size;                                                   \
+        this->mUnpaddedHiddenSize = 2880;                                                                              \
+                                                                                                                       \
+        if (!this->checkSufficientTestMemory(75, hidden_size, 128, 4, true))                                           \
+        {                                                                                                              \
+            GTEST_SKIP() << "Insufficient free memory for test";                                                       \
+        }                                                                                                              \
+                                                                                                                       \
+        this->ParallelismType##Test(4, hidden_size, 128, 75, inter_size_fraction);                                     \
     }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
@@ -1985,7 +2185,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     {                                                                                                                  \
         this->mIsLongTest = true;                                                                                      \
         /* This test is very slow. Only do one k value */                                                              \
-        this->ParallelismType##Test(2, this->MINIMUM_ALIGNMENT, 512, 3, this->ANY_FP4 ? 8.0f : 4.0f);                  \
+        this->ParallelismType##Test(2, this->mDeviceMinimumAlignment, 512, 3, this->ANY_FP4 ? 8.0f : 4.0f);            \
     }
 
 PARALLEL_TEST_SUITE(ExpertParallel)
@@ -1995,6 +2195,7 @@ PARALLEL_TEST_SUITE(MixedParallel)
 TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
 {
     this->mIsLongTest = true;
+    this->mUseFusedFinalize = true; // True for all cases because we sweep both
     auto genConfigName = [](auto conf) -> std::string
     {
         using namespace tensorrt_llm::cutlass_extensions;
@@ -2003,8 +2204,9 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
         if (conf.is_tma_warp_specialized)
         {
             tactic << conf.getTileConfigAsInt() << " and cluster shape " << (int) conf.cluster_shape
-                   << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
-                   << (int) conf.epilogue_schedule;
+                   << " dynamic cluster shape " << (int) conf.dynamic_cluster_shape << " mainloop sched "
+                   << (int) conf.mainloop_schedule << " epi sched " << (int) conf.epilogue_schedule
+                   << " epilogue fusion " << (int) conf.epilogue_fusion_type << " swap ab " << (int) conf.swap_ab;
         }
         else if (conf.tile_config_sm80 != CutlassTileConfig::ChooseWithHeuristic)
         {
@@ -2018,16 +2220,24 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
         return tactic.str();
     };
 
-    auto activation_pool = std::vector{ActivationType::Relu, ActivationType::Swiglu, ActivationType::Geglu};
+    auto activation_pool = std::vector{ActivationType::Relu, ActivationType::Swiglu, ActivationType::SwigluBias};
     if (this->NVFP4)
         activation_pool = {ActivationType::Relu};
-    auto configs = this->getFilteredConfigs(getSMVersion());
+    auto configs1 = this->getFilteredConfigs(getSMVersion(), MoeGemmId::GEMM_1);
+    auto configs2 = this->getFilteredConfigs(getSMVersion(), MoeGemmId::GEMM_2);
     for (auto const activation_type : activation_pool)
     {
-        for (auto conf1 : configs)
+        for (auto conf1 : configs1)
         {
-            for (auto conf2 : configs)
+            if (conf1.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::Undefined
+                && conf1.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_4x1x1)
+                continue; // To reduce the number of iterations we only test one dynamic cluster shape
+            for (auto conf2 : configs2)
             {
+                if (conf2.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::Undefined
+                    && conf2.dynamic_cluster_shape
+                        != tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_4x1x1)
+                    continue; // To reduce the number of iterations we only test one dynamic cluster shape
                 auto name1 = genConfigName(conf1);
                 auto name2 = genConfigName(conf2);
                 if (name1.empty() || name2.empty())
@@ -2036,12 +2246,11 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
                 }
                 ASSERT_NO_THROW({
                     this->mActType = activation_type;
-                    for (int k = 1; k <= 3; k++)
+                    for (auto k : {2, 3})
                     {
-
                         this->mOverrideSelectedConfig1 = conf1;
                         this->mOverrideSelectedConfig2 = conf2;
-                        this->BasicPermuteTest(k);
+                        this->BasicPermuteTest(k, this->mDeviceMinimumAlignment);
                         if (::testing::Test::HasFailure()) // Throw on test failure so we get the print message
                             throw std::runtime_error("Test k=" + std::to_string(k) + " Failed");
                     }
@@ -2075,7 +2284,7 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLargeExperts)
 TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
 {
     this->mIsLongTest = true;
-    this->mUseBias = !this->ANY_FPX;
+    this->mUseBias = !this->NVFP4;
 
     using DataType = typename MixtureOfExpertsTest<TypeParam>::DataType;
     // Sequence * hidden size > INT32_MAX
@@ -2105,6 +2314,7 @@ TYPED_TEST(LargeMixtureOfExpertsTest, PermuteVeryLongSequence)
         token_selected_experts[i] = i % num_experts;
     }
 
+    this->initLocals(hidden_size, num_experts, k, num_tokens);
     this->runMoEPermute(hidden_states, token_selected_experts, token_final_scales, hidden_size, num_experts, k);
 
     // Just look at the first few tokens
@@ -2168,8 +2378,8 @@ TYPED_TEST(MixtureOfExpertsTest, RunProfiler)
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
             typeToDtypeID<typename TypeParam::WeightType>(), typeToDtypeID<typename TypeParam::OutputType>(),
-            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
-            ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
+            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4,
+            this->mGroupSize, ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/true, MOEParallelismConfig{}, /*enable_alltoall=*/false);
 #else
         backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
@@ -2219,8 +2429,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 1024, 4096, mGroupSize, {},
+                false, mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
                 /*enable_alltoall=*/false);
 #else
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
