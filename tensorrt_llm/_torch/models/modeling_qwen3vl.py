@@ -1,13 +1,24 @@
 import copy
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+    Qwen3VLVisionModel,
+    Qwen3VLVisionPatchEmbed,
+    Qwen3VLVisionRotaryEmbedding,
+)
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+from tensorrt_llm._torch.modules.linear import (
+    Linear,
+    TensorParallelMode,
+    WeightMode,
+    WeightsLoadingConfig,
+)
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
@@ -25,6 +36,7 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..attention_backend.utils import get_attention_backend
 from ..modules.embedding import Embedding
 from ..modules.rotary_embedding import MRotaryEmbedding
 from .modeling_auto import AutoModelForCausalLM
@@ -33,7 +45,15 @@ from .modeling_multimodal_utils import (
     filter_mm_token_from_input_ids,
     find_input_mm_embeds,
 )
-from .modeling_utils import ModelConfig, register_auto_model, register_vision_encoder
+from .modeling_qwen2vl import Qwen2_5_VLVisionAttention
+from .modeling_utils import (
+    ModelConfig,
+    QuantConfig,
+    _load_weights_impl,
+    filter_weights,
+    register_auto_model,
+    register_vision_encoder,
+)
 
 DISAGG = os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
@@ -333,14 +353,14 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         pixel_values = processed_inputs.get("pixel_values", None)
         if pixel_values is not None:
             multimodal_data["image"] = {
-                "pixel_values": pixel_values,
+                "pixel_values": pixel_values.to(self.dtype),
                 "image_grid_thw": processed_inputs.get("image_grid_thw"),
             }
 
         pixel_values_videos = processed_inputs.get("pixel_values_videos", None)
         if pixel_values_videos is not None:
             multimodal_data["video"] = {
-                "pixel_values_videos": pixel_values_videos,
+                "pixel_values_videos": pixel_values_videos.to(self.dtype),
                 "video_grid_thw": processed_inputs.get("video_grid_thw"),
             }
 
@@ -362,6 +382,324 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, InputProcessor):
         }
 
 
+class Qwen3_VLVisionAttention(Qwen2_5_VLVisionAttention):
+    def __init__(self, model_config, layer_idx):
+        model_config.pretrained_config.max_position_embeddings = (
+            model_config.pretrained_config.text_config.max_position_embeddings
+        )
+        super().__init__(model_config, layer_idx)
+
+
+class Qwen3_VLVisionMLP(torch.nn.Module):
+    def __init__(self, model_config):
+        super().__init__()
+        config = model_config.pretrained_config.vision_config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.linear_fc1 = Linear(
+            self.hidden_size,
+            self.intermediate_size,
+            bias=True,
+            dtype=model_config.pretrained_config.torch_dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+        self.act_fn = nn.SELU()
+        self.linear_fc2 = Linear(
+            self.intermediate_size,
+            self.hidden_size,
+            dtype=model_config.pretrained_config.torch_dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+
+    @torch.inference_mode()
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
+
+
+class Qwen3_VLVisionBlock(torch.nn.Module):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: Optional[int]):
+        super().__init__()
+        config = model_config.pretrained_config.vision_config
+        self.norm1 = nn.LayerNorm(
+            config.hidden_size, eps=1e-6, dtype=model_config.pretrained_config.torch_dtype
+        )
+        self.norm2 = nn.LayerNorm(
+            config.hidden_size, eps=1e-6, dtype=model_config.pretrained_config.torch_dtype
+        )
+        self.attn = Qwen3_VLVisionAttention(model_config, layer_idx)
+        self.mlp = Qwen3_VLVisionMLP(model_config)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.norm1(hidden_states)
+        hidden_states = residual + self.attn(
+            hidden_states=hidden_states,
+            rotary_pos_emb=rotary_pos_emb,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+
+        residual = hidden_states
+        hidden_states = self.norm2(hidden_states)
+        hidden_states = residual + self.mlp(hidden_states)
+        return hidden_states
+
+
+class Qwen3_VLPatchMerger(torch.nn.Module):
+    def __init__(
+        self, model_config: ModelConfig[PretrainedConfig], use_postshuffle_norm: bool = False
+    ) -> None:
+        super().__init__()
+        config = model_config.pretrained_config.vision_config
+        self.hidden_size = config.hidden_size * (config.spatial_merge_size**2)
+        self.use_postshuffle_norm = use_postshuffle_norm
+        self.norm = nn.LayerNorm(
+            self.hidden_size if use_postshuffle_norm else config.hidden_size, eps=1e-6
+        )
+        self.linear_fc1 = Linear(
+            in_features=self.hidden_size,
+            out_features=self.hidden_size,
+            bias=True,
+            dtype=model_config.pretrained_config.torch_dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.COLUMN,
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+        self.act_fn = nn.GELU()
+        self.linear_fc2 = Linear(
+            in_features=self.hidden_size,
+            out_features=config.out_hidden_size,
+            bias=True,
+            dtype=model_config.pretrained_config.torch_dtype,
+            mapping=model_config.mapping,
+            tensor_parallel_mode=TensorParallelMode.ROW,
+            allreduce_strategy=model_config.allreduce_strategy,
+        )
+
+    @torch.inference_mode()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.norm(x.view(-1, self.hidden_size) if self.use_postshuffle_norm else x).view(
+            -1, self.hidden_size
+        )
+        x = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
+        return x
+
+
+class Qwen3_VisionModel(torch.nn.Module):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        super().__init__()
+        self.model_config = model_config
+        self.config = self.model_config.pretrained_config.vision_config
+
+        self.spatial_merge_size = self.config.spatial_merge_size
+        self.patch_size = self.config.patch_size
+        self.spatial_merge_unit = self.spatial_merge_size * self.spatial_merge_size
+
+        self.patch_embed = Qwen3VLVisionPatchEmbed(
+            config=self.config,
+        )
+
+        self.pos_embed = nn.Embedding(self.config.num_position_embeddings, self.config.hidden_size)
+        self.num_grid_per_side = int(self.config.num_position_embeddings**0.5)
+
+        head_dim = self.config.hidden_size // self.config.num_heads
+        self.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(head_dim // 2)
+
+        self.blocks = nn.ModuleList(
+            [
+                Qwen3_VLVisionBlock(model_config, layer_idx=layer_idx)
+                for layer_idx in range(self.config.depth)
+            ]
+        )
+        self.merger = Qwen3_VLPatchMerger(
+            model_config=model_config,
+            use_postshuffle_norm=False,
+        )
+        self.deepstack_visual_indexes = self.config.deepstack_visual_indexes
+        self.deepstack_merger_list = nn.ModuleList(
+            [
+                Qwen3_VLPatchMerger(
+                    model_config=model_config,
+                    use_postshuffle_norm=True,
+                )
+                for _ in range(len(self.deepstack_visual_indexes))
+            ]
+        )
+        self.metadata_cls = get_attention_backend(self.model_config.attn_backend).Metadata
+
+        self.attn_metadata = self.metadata_cls(
+            max_num_requests=8192,  # TODO: Make this dynamic
+            max_num_tokens=8192,  # TODO: Make this dynamic
+            kv_cache_manager=None,
+        )
+        print("init success, state_dict keys:", self.state_dict().keys())
+        for k, v in self.state_dict().items():
+            print(model_config.mapping.rank, k, v.shape)
+
+    def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        merge_size = self.spatial_merge_size
+
+        max_hw = int(grid_thw[:, 1:].max().item())
+        freq_table = self.rotary_pos_emb(max_hw)  # (max_hw, dim // 2)
+        device = freq_table.device
+
+        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
+        pos_ids = torch.empty((total_tokens, 2), dtype=torch.long, device=device)
+
+        offset = 0
+        for num_frames, height, width in grid_thw:
+            merged_h, merged_w = height // merge_size, width // merge_size
+
+            block_rows = torch.arange(merged_h, device=device)  # block row indices
+            block_cols = torch.arange(merged_w, device=device)  # block col indices
+            intra_row = torch.arange(merge_size, device=device)  # intra-block row offsets
+            intra_col = torch.arange(merge_size, device=device)  # intra-block col offsets
+
+            # Compute full-resolution positions
+            row_idx = block_rows[:, None, None, None] * merge_size + intra_row[None, None, :, None]
+            col_idx = block_cols[None, :, None, None] * merge_size + intra_col[None, None, None, :]
+
+            row_idx = row_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+            col_idx = col_idx.expand(merged_h, merged_w, merge_size, merge_size).reshape(-1)
+
+            coords = torch.stack((row_idx, col_idx), dim=-1)
+
+            if num_frames > 1:
+                coords = coords.repeat(num_frames, 1)
+
+            num_tokens = coords.shape[0]
+            pos_ids[offset : offset + num_tokens] = coords
+            offset += num_tokens
+
+        embeddings = freq_table[pos_ids]  # lookup rotary embeddings
+        embeddings = embeddings.flatten(1)
+        return embeddings
+
+    def fast_pos_embed_interpolate(self, grid_thw):
+        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
+            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+
+            h_idxs_floor = h_idxs.int()
+            w_idxs_floor = w_idxs.int()
+            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
+
+            base_h = h_idxs_floor * self.num_grid_per_side
+            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+            indices = [
+                (base_h[None].T + w_idxs_floor[None]).flatten(),
+                (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+            ]
+
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
+
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=self.pos_embed.weight.device)
+        weight_tensor = torch.tensor(
+            weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device
+        )
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
+
+        patch_pos_embeds_permute = []
+        merge_size = self.config.spatial_merge_size
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            pos_embed = pos_embed.repeat(t, 1)
+            pos_embed = (
+                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+            patch_pos_embeds_permute.append(pos_embed)
+        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
+        return patch_pos_embeds
+
+    def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
+        # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
+        batch_size = len(seq_lens)
+        prompt_lens = seq_lens
+        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
+        request_ids = list(range(1, batch_size + 1))
+
+        attn_metadata.num_contexts = batch_size
+        attn_metadata.request_ids = request_ids
+        attn_metadata.prompt_lens = prompt_lens
+        attn_metadata.seq_lens = seq_lens
+        attn_metadata.max_seq_len = seq_lens.max().item()
+        attn_metadata.prepare()
+        return attn_metadata
+
+    @torch.inference_mode()
+    def forward(
+        self, hidden_states: torch.Tensor, grid_thw: torch.Tensor, **kwargs
+    ) -> torch.Tensor:
+        seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
+
+        # Getting positional embedding
+        rotary_pos_emb = self.rot_pos_emb(grid_thw)
+
+        attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
+
+        # From this point, pure GPU operation
+        hidden_states = self.patch_embed(hidden_states)
+        seq_len, _ = hidden_states.size()
+        hidden_states = hidden_states.reshape(seq_len, -1)
+
+        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
+        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        position_embeddings = (emb.cos(), emb.sin())
+
+        deepstack_feature_lists = []
+        for layer_num, block in enumerate(self.blocks):
+            hidden_states = block(
+                hidden_states,
+                attn_metadata=attn_metadata,
+                position_embeddings=position_embeddings,
+            )
+            if layer_num in self.deepstack_visual_indexes:
+                deepstack_feature = self.deepstack_merger_list[
+                    self.deepstack_visual_indexes.index(layer_num)
+                ](hidden_states)
+                deepstack_feature_lists.append(deepstack_feature)
+        hidden_states = self.merger(hidden_states)
+
+        return hidden_states, deepstack_feature_lists
+
+
 class Qwen3VisionModelBase(nn.Module):
     def __init__(
         self,
@@ -374,10 +712,17 @@ class Qwen3VisionModelBase(nn.Module):
         self.model_config = model_config
         self.model_dtype = config.torch_dtype
 
+        self.model_config.quant_config = QuantConfig(
+            kv_cache_quant_algo=self.model_config.quant_config.kv_cache_quant_algo
+        )
+
         if model_class == Qwen3VLVisionModel:
             # NOTE: For hf impl, we use flash_attention_2 for attention implementation to avoid OOM issue.
             config._attn_implementation = "flash_attention_2"
+            print("fallback to hf impl")
             self.visual = model_class(config).to(self.model_dtype).eval()
+        elif model_class == Qwen3_VisionModel:
+            self.visual = model_class(self.model_config).to(self.model_dtype)
         else:
             raise NotImplementedError(f"Model class {model_class} not implemented")
 
@@ -385,6 +730,36 @@ class Qwen3VisionModelBase(nn.Module):
 
     def post_config(self):
         self.config = self.model_config.pretrained_config.vision_config
+
+    def load_weights(self, weights: Dict):
+        visual_weights = filter_weights("model.visual", weights)
+        converted_weights = dict()
+
+        qkv_pattern = re.compile(r"(.*?)attn\.qkv\.(.*)")
+        for name in visual_weights:
+            # Handle with weights and bias for vision transformer's qkv projection.
+            match = qkv_pattern.match(name)
+            if match:
+                prefix, suffix = match.groups()
+                q_name = f"{prefix}attn.q_proj.{suffix}"
+                k_name = f"{prefix}attn.k_proj.{suffix}"
+                v_name = f"{prefix}attn.v_proj.{suffix}"
+                dim_shape = visual_weights[name].shape[0] // 3
+                converted_weights[q_name] = visual_weights[name][:dim_shape]
+                converted_weights[k_name] = visual_weights[name][dim_shape : 2 * dim_shape]
+                converted_weights[v_name] = visual_weights[name][2 * dim_shape :]
+            else:
+                converted_weights[name] = visual_weights[name]
+        pattern_mapping = {
+            r"(.*?)attn.proj.(.*)": r"\1attn.o_proj.\2",
+            r"(.*?)mlp.fc1.(.*)": r"\1mlp.up_proj.\2",
+            r"(.*?)mlp.fc2.(.*)": r"\1mlp.down_proj.\2",
+        }
+        self.visual.config.num_attention_heads = self.visual.config.num_heads
+        print(converted_weights.keys())
+        for k, v in converted_weights.items():
+            print(k, v.shape)
+        _load_weights_impl(self.visual, converted_weights, params_map=pattern_mapping)
 
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]
@@ -486,17 +861,17 @@ class Qwen3VLModelBase(PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
-        if not DISAGG:
-            self.mm_encoder = Qwen3VisionModelBase(
-                model_config, kwargs.get("vision_model_class", None)
-            ).eval()
-
         llm_model_config = copy.deepcopy(model_config)
         llm_model_config.pretrained_config = config.text_config
         llm_model_config.pretrained_config.architectures = ["Qwen3ForCausalLM"]
 
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
         self.model_dtype = getattr(config, "torch_dtype", torch.bfloat16)
+
+        if not DISAGG:
+            self.mm_encoder = Qwen3VisionModelBase(
+                model_config, kwargs.get("vision_model_class", None)
+            ).eval()
         logger.info(f"{self.dtype=} {self.model_dtype=}")
         self.post_config()
         self.is_loaded = True
@@ -733,7 +1108,11 @@ def get_multimodal_embeddings_qwen3(
     return encoder_outputs, deepstack_features
 
 
-@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=Qwen3VLVisionModel)
+VISION_MODEL_CLS = Qwen3_VisionModel
+
+
+# VISION_MODEL_CLS = Qwen3VLVisionModel
+@register_vision_encoder(Qwen3VisionModelBase, vlm_base_model=VISION_MODEL_CLS)
 @register_auto_model("Qwen3VLForConditionalGeneration")
 @register_input_processor(
     Qwen3VLInputProcessorBase,
@@ -749,7 +1128,7 @@ def get_multimodal_embeddings_qwen3(
 class Qwen3VLModelTRT(Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
-        kwargs["vision_model_class"] = Qwen3VLVisionModel
+        kwargs["vision_model_class"] = VISION_MODEL_CLS
         super().__init__(model_config, *args, **kwargs)
 
     @property
@@ -765,8 +1144,14 @@ class Qwen3VLModelTRT(Qwen3VLModelBase):
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if not DISAGG:
-            vision_encoder_weights = process_weights(weights, "visual")
-            self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
+            if VISION_MODEL_CLS == Qwen3VLVisionModel:
+                vision_encoder_weights = process_weights(weights, "visual")
+                self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
+            else:
+                print("start load trtllm vision weights")
+                print(self.mm_encoder.load_weights.__code__)
+                self.mm_encoder.load_weights(weights)
+
         transformed_weights = {}
         language_model_prefix = "model.language_model."
         for key, value in weights.items():
