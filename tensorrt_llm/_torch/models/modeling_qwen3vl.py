@@ -544,9 +544,6 @@ class Qwen3_VisionModel(torch.nn.Module):
             max_num_tokens=8192,  # TODO: Make this dynamic
             kv_cache_manager=None,
         )
-        print("init success, state_dict keys:", self.state_dict().keys())
-        for k, v in self.state_dict().items():
-            print(model_config.mapping.rank, k, v.shape)
 
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         merge_size = self.spatial_merge_size
@@ -719,7 +716,6 @@ class Qwen3VisionModelBase(nn.Module):
         if model_class == Qwen3VLVisionModel:
             # NOTE: For hf impl, we use flash_attention_2 for attention implementation to avoid OOM issue.
             config._attn_implementation = "flash_attention_2"
-            print("fallback to hf impl")
             self.visual = model_class(config).to(self.model_dtype).eval()
         elif model_class == Qwen3_VisionModel:
             self.visual = model_class(self.model_config).to(self.model_dtype)
@@ -756,9 +752,6 @@ class Qwen3VisionModelBase(nn.Module):
             r"(.*?)mlp.fc2.(.*)": r"\1mlp.down_proj.\2",
         }
         self.visual.config.num_attention_heads = self.visual.config.num_heads
-        print(converted_weights.keys())
-        for k, v in converted_weights.items():
-            print(k, v.shape)
         _load_weights_impl(self.visual, converted_weights, params_map=pattern_mapping)
 
     def _parse_and_batch_multimodal_data(
@@ -1148,8 +1141,6 @@ class Qwen3VLModelTRT(Qwen3VLModelBase):
                 vision_encoder_weights = process_weights(weights, "visual")
                 self.mm_encoder.load_state_dict(vision_encoder_weights, strict=True)
             else:
-                print("start load trtllm vision weights")
-                print(self.mm_encoder.load_weights.__code__)
                 self.mm_encoder.load_weights(weights)
 
         transformed_weights = {}
