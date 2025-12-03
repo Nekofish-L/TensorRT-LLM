@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
+from transformers.activations import ACT2FN
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     Qwen3VLVisionModel,
     Qwen3VLVisionPatchEmbed,
@@ -400,19 +401,19 @@ class Qwen3_VLVisionMLP(torch.nn.Module):
             self.hidden_size,
             self.intermediate_size,
             bias=True,
-            dtype=model_config.pretrained_config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
             allreduce_strategy=model_config.allreduce_strategy,
         )
-        self.act_fn = nn.SELU()
+        self.act_fn = ACT2FN[config.hidden_act]
         self.linear_fc2 = Linear(
             self.intermediate_size,
             self.hidden_size,
-            dtype=model_config.pretrained_config.torch_dtype,
+            bias=True,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
+            weights_loading_config=WeightsLoadingConfig(weight_mode=WeightMode.VANILLA),
             allreduce_strategy=model_config.allreduce_strategy,
         )
 
@@ -433,6 +434,7 @@ class Qwen3_VLVisionBlock(torch.nn.Module):
         )
         self.attn = Qwen3_VLVisionAttention(model_config, layer_idx)
         self.mlp = Qwen3_VLVisionMLP(model_config)
+        # self.mlp = Qwen3VLVisionMLP(config)
 
     @torch.inference_mode()
     def forward(
@@ -472,7 +474,6 @@ class Qwen3_VLPatchMerger(torch.nn.Module):
             in_features=self.hidden_size,
             out_features=self.hidden_size,
             bias=True,
-            dtype=model_config.pretrained_config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
             allreduce_strategy=model_config.allreduce_strategy,
@@ -482,7 +483,6 @@ class Qwen3_VLPatchMerger(torch.nn.Module):
             in_features=self.hidden_size,
             out_features=config.out_hidden_size,
             bias=True,
-            dtype=model_config.pretrained_config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.ROW,
             allreduce_strategy=model_config.allreduce_strategy,
