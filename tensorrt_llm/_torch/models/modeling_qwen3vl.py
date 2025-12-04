@@ -97,14 +97,19 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
     def __init__(
         self,
         model_path: str,
-        model_config: PretrainedConfig,
+        config: PretrainedConfig,
         tokenizer: AutoTokenizer,
         trust_remote_code: bool = True,
+        **kwargs,
     ):
-        super().__init__()
-        BaseMultimodalDummyInputsBuilder.__init__(self)
-        self.model_config = model_config
-        self._dtype = self.model_config.torch_dtype
+        super().__init__(
+            model_path=model_path,
+            config=config,
+            tokenizer=tokenizer,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
+        self._dtype = self.config.text_config.dtype
         self._tokenizer = (
             tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(model_path)
         )
@@ -112,13 +117,13 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         self._processor = AutoProcessor.from_pretrained(
             model_path, use_fast=True, trust_remote_code=trust_remote_code
         )
-        self.tllm_multimodal_token_id = self.model_config.text_config.vocab_size + 1
+        self.tllm_multimodal_token_id = self.get_vocab_size() + 1
         # temporal patch size for video frames
-        self.temporal_patch_size = getattr(model_config.vision_config, "temporal_patch_size", 1)
+        self.temporal_patch_size = getattr(self.config.vision_config, "temporal_patch_size", 1)
 
     @property
     def config(self) -> PretrainedConfig:
-        return self.model_config
+        return self._config
 
     @property
     def tokenizer(self) -> AutoTokenizer:
@@ -138,7 +143,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
 
     def get_vocab_size(self) -> int:
         """Return the vocab size of the model."""
-        return self.model_config.text_config.vocab_size
+        return self.config.text_config.vocab_size
 
     @classmethod
     def get_rope_index(
@@ -308,8 +313,8 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         )
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
-        masks = (input_ids == self.model_config.image_token_id) | (
-            input_ids == self.model_config.video_token_id
+        masks = (input_ids == self.config.image_token_id) | (
+            input_ids == self.config.video_token_id
         )
         input_ids[masks] = self.tllm_multimodal_token_id
         return input_ids
@@ -322,7 +327,7 @@ class Qwen3VLInputProcessorBase(BaseMultimodalInputProcessor, BaseMultimodalDumm
         attention_mask: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         mrope_position_ids, mrope_position_deltas = Qwen3VLInputProcessorBase.get_rope_index(
-            self.model_config, input_ids, image_grid_thw, video_grid_thw, attention_mask
+            self.config, input_ids, image_grid_thw, video_grid_thw, attention_mask
         )
 
         mrope_config = {}
