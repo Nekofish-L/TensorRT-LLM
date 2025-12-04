@@ -1039,7 +1039,7 @@ class Qwen3VLModelBase(PreTrainedModel):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ),
 )
-class Qwen3VLModelTRT(Qwen3VLModelBase):
+class Qwen3VLModel(Qwen3VLModelBase):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         # NOTE: HF implementation.
         kwargs["vision_model_class"] = Qwen3VisionModel
